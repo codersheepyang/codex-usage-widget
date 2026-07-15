@@ -84,6 +84,161 @@ function Get-ResetText($unixSeconds) {
     } catch { return '重置时间未知' }
 }
 
+function Get-UsageLogs([int]$MaxItems = 100) {
+    $roots = @((Join-Path $script:CodexHome 'sessions'), (Join-Path $script:CodexHome 'archived_sessions')) |
+        Where-Object { Test-Path -LiteralPath $_ }
+    $files = Get-ChildItem -LiteralPath $roots -Filter '*.jsonl' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 10
+    $items = New-Object Collections.Generic.List[object]
+
+    foreach ($file in $files) {
+        $current = $null
+        foreach ($line in Get-FastTailLines $file.FullName 8388608) {
+            if ($line -notmatch '"user_message"|"token_count"') { continue }
+            try { $record = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ($record.type -ne 'event_msg') { continue }
+
+            if ($record.payload.type -eq 'user_message') {
+                if ($current -and $current.Tokens -gt 0) { $items.Add([pscustomobject]$current) }
+                $message = [string]$record.payload.message
+                $message = ($message -replace '\s+', ' ').Trim()
+                if ($message.Length -gt 80) { $message = $message.Substring(0, 80) + '…' }
+                $current = [ordered]@{
+                    Start = ([datetime]$record.timestamp).ToLocalTime()
+                    End = ([datetime]$record.timestamp).ToLocalTime()
+                    Question = $(if ($message) { $message } else { '（图片或附件提问）' })
+                    Tokens = [long]0
+                    InputTokens = [long]0
+                    OutputTokens = [long]0
+                }
+            } elseif ($record.payload.type -eq 'token_count' -and $current -and $record.payload.info.last_token_usage) {
+                $usage = $record.payload.info.last_token_usage
+                $current.Tokens += [long]$usage.total_tokens
+                $current.InputTokens += [long]$usage.input_tokens
+                $current.OutputTokens += [long]$usage.output_tokens
+                $current.End = ([datetime]$record.timestamp).ToLocalTime()
+            }
+        }
+        if ($current -and $current.Tokens -gt 0) { $items.Add([pscustomobject]$current) }
+    }
+
+    $selected = @($items | Sort-Object Start -Descending | Select-Object -First $MaxItems)
+    $total = [double](($selected | Measure-Object Tokens -Sum).Sum)
+    foreach ($item in $selected) {
+        [pscustomobject]@{
+            TimeRange = if ($item.Start.Date -eq $item.End.Date) {
+                '{0:MM-dd HH:mm:ss}–{1:HH:mm:ss}' -f $item.Start, $item.End
+            } else { '{0:MM-dd HH:mm}–{1:MM-dd HH:mm}' -f $item.Start, $item.End }
+            Question = $item.Question
+            Tokens = $item.Tokens
+            Input = $item.InputTokens
+            Output = $item.OutputTokens
+            Share = if ($total -gt 0) { '{0:N2}%' -f ($item.Tokens / $total * 100) } else { '0.00%' }
+        }
+    }
+}
+
+if ($env:CODEX_USAGE_WIDGET_LOG_EXPORT -eq '1') {
+    @(Get-UsageLogs) | ConvertTo-Json -Depth 4 -Compress
+    exit
+}
+
+function Show-UsageLogWindow {
+    if ($script:LogWindow -and $script:LogWindow.IsVisible) {
+        $script:LogWindow.Activate()
+        return
+    }
+    [xml]$logXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ Title="Codex Token 日志" Width="900" Height="520" MinWidth="720" MinHeight="360"
+ WindowStartupLocation="CenterScreen" Background="#FFF9F7F3" ShowInTaskbar="False"
+ FontFamily="Segoe UI Variable Text, Segoe UI">
+ <Grid Margin="16">
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <Grid Grid.Row="0" Margin="0,0,0,12">
+   <StackPanel>
+    <TextBlock Text="Token 使用日志" FontSize="18" FontWeight="SemiBold" Foreground="#FF252525"/>
+    <TextBlock Text="同一提问触发的多次模型调用已合并；占比基于下方日志的 Token 总量。" FontSize="11" Foreground="#FF747474" Margin="0,4,0,0"/>
+   </StackPanel>
+   <Button Name="ReloadLogButton" Content="刷新" HorizontalAlignment="Right" Width="64" Height="28" Background="#FFFFFFFF" BorderBrush="#FFD8D4CE"/>
+  </Grid>
+  <DataGrid Name="LogGrid" Grid.Row="1" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False"
+   GridLinesVisibility="Horizontal" HeadersVisibility="Column" RowHeaderWidth="0" Background="#FFFFFFFF"
+   BorderBrush="#FFE2DED7" AlternatingRowBackground="#FFFAF9F7" RowHeight="34">
+   <DataGrid.Columns>
+    <DataGridTextColumn Header="时间段" Binding="{Binding TimeRange}" Width="175"/>
+    <DataGridTextColumn Header="提问" Binding="{Binding Question}" Width="*"/>
+    <DataGridTextColumn Header="Token" Binding="{Binding Tokens, StringFormat=N0}" Width="90"/>
+    <DataGridTextColumn Header="输入" Binding="{Binding Input, StringFormat=N0}" Width="85"/>
+    <DataGridTextColumn Header="输出" Binding="{Binding Output, StringFormat=N0}" Width="85"/>
+    <DataGridTextColumn Header="占比" Binding="{Binding Share}" Width="75"/>
+   </DataGrid.Columns>
+  </DataGrid>
+  <TextBlock Name="LogSummary" Grid.Row="2" Margin="0,10,0,0" Foreground="#FF747474" FontSize="11"/>
+ </Grid>
+</Window>
+'@
+    $script:LogWindow = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $logXaml))
+    $script:LogGrid = $script:LogWindow.FindName('LogGrid')
+    $script:LogSummary = $script:LogWindow.FindName('LogSummary')
+    $script:LogWindow.Show()
+
+    $reload = {
+        if ($script:LogLoadProcess -and -not $script:LogLoadProcess.HasExited) { return }
+        $script:LogGrid.ItemsSource = $null
+        $script:LogSummary.Text = '正在后台读取日志…'
+        $script:LogTempFile = Join-Path $env:TEMP ('codex-usage-' + [guid]::NewGuid().ToString('N') + '.json')
+        $script:LogErrorFile = $script:LogTempFile + '.err'
+        $environmentBackup = $env:CODEX_USAGE_WIDGET_LOG_EXPORT
+        $env:CODEX_USAGE_WIDGET_LOG_EXPORT = '1'
+        try {
+            $script:LogLoadProcess = Start-Process powershell.exe -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput $script:LogTempFile -RedirectStandardError $script:LogErrorFile `
+                -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $PSCommandPath + '"'))
+        } finally {
+            if ($null -eq $environmentBackup) { Remove-Item Env:CODEX_USAGE_WIDGET_LOG_EXPORT -ErrorAction SilentlyContinue }
+            else { $env:CODEX_USAGE_WIDGET_LOG_EXPORT = $environmentBackup }
+        }
+        $script:LogLoadStarted = Get-Date
+        if ($script:LogPollTimer) { $script:LogPollTimer.Stop() }
+        $script:LogPollTimer = New-Object Windows.Threading.DispatcherTimer
+        $script:LogPollTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+        $script:LogPollTimer.Add_Tick({
+            if (-not $script:LogLoadProcess.HasExited) {
+                if (((Get-Date) - $script:LogLoadStarted).TotalSeconds -gt 30) {
+                    Stop-Process -Id $script:LogLoadProcess.Id -Force -ErrorAction SilentlyContinue
+                    $script:LogPollTimer.Stop()
+                    $script:LogSummary.Text = '日志读取超时，请点击刷新重试。'
+                    $script:LogLoadProcess = $null
+                }
+                return
+            }
+            $script:LogPollTimer.Stop()
+            try {
+                $json = Get-Content -Raw -LiteralPath $script:LogTempFile -ErrorAction Stop
+                $data = if ($json) { @($json | ConvertFrom-Json) } else { @() }
+                $script:LogGrid.ItemsSource = $data
+                $sum = ($data | Measure-Object Tokens -Sum).Sum
+                $script:LogSummary.Text = '共 {0} 次提问 · 合计 {1:N0} Token · 最多显示最近 100 条' -f $data.Count, $sum
+            } catch {
+                $script:LogSummary.Text = '日志读取失败，请点击刷新重试。'
+            } finally {
+                Remove-Item -LiteralPath $script:LogTempFile, $script:LogErrorFile -Force -ErrorAction SilentlyContinue
+                $script:LogLoadProcess = $null
+            }
+        })
+        $script:LogPollTimer.Start()
+    }
+    $script:LogWindow.FindName('ReloadLogButton').Add_Click($reload)
+    $script:LogWindow.Add_Closed({
+        if ($script:LogPollTimer) { $script:LogPollTimer.Stop() }
+        $script:LogGrid = $null
+        $script:LogSummary = $null
+        $script:LogWindow = $null
+    })
+    & $reload
+}
+
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
  Title="Codex 用量" Width="272" Height="122" WindowStyle="None" ResizeMode="NoResize"
@@ -92,9 +247,11 @@ function Get-ResetText($unixSeconds) {
  <Border CornerRadius="12" Background="#FFF9F7F3" BorderBrush="#FFE2DED7" BorderThickness="1" Padding="13,10,13,9">
   <Grid>
    <Grid.RowDefinitions><RowDefinition Height="24"/><RowDefinition Height="62"/><RowDefinition Name="SecondaryRowDefinition" Height="0"/><RowDefinition Height="16"/></Grid.RowDefinitions>
-   <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
+   <Grid Grid.Row="0">
     <TextBlock Text="Codex 用量" Foreground="#FF252525" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
-   </StackPanel>
+    <Button Name="LogButton" Content="日志" HorizontalAlignment="Right" Width="42" Height="22" FontSize="11"
+     Foreground="#FF555555" Background="#FFFFFFFF" BorderBrush="#FFD8D4CE" BorderThickness="1"/>
+   </Grid>
    <Grid Name="Row1" Grid.Row="1" Margin="0,3,0,0">
     <Grid.RowDefinitions><RowDefinition Height="22"/><RowDefinition Height="12"/><RowDefinition Height="22"/></Grid.RowDefinitions>
     <Grid Grid.Row="0">
@@ -153,7 +310,10 @@ function Update-Widget {
     $status.Text = '更新于 ' + $latest.Timestamp.ToLocalTime().ToString('HH:mm:ss')
 }
 
-$window.Add_MouseLeftButtonDown({ if ($_.ButtonState -eq 'Pressed') { $window.DragMove() } })
+$window.Add_MouseLeftButtonDown({
+    if ($_.ButtonState -eq 'Pressed' -and $_.OriginalSource -isnot [Windows.Controls.Button]) { $window.DragMove() }
+})
+$window.FindName('LogButton').Add_Click({ Show-UsageLogWindow })
 $workArea = [System.Windows.SystemParameters]::WorkArea
 $window.Left = $workArea.Right - $window.Width - 14
 $window.Top = $workArea.Bottom - $window.Height - 14
