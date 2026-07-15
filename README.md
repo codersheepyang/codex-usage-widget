@@ -5,12 +5,23 @@
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell)
 
+## 效果预览
+
+### 用量悬浮窗
+
+![Codex 用量悬浮窗](docs/images/usage-widget.png)
+
+### Token 日志与今日总结
+
+![Codex Token 日志与今日总结](docs/images/token-log.png)
+
 ## 功能
 
 - 显示 Codex 当前周期的剩余用量
 - 显示配额重置时间和剩余时长
 - 自动读取最新用量并定时刷新
 - 按提问查看时间段、输入/输出 Token、总 Token 和占比
+- 按 Codex 任务会话生成“今天大约做了几件事”的主题总结
 - 日志窗口异步加载，读取期间不阻塞悬浮窗
 - 始终置顶，可拖动到任意位置
 - 无标题栏、无任务栏图标
@@ -35,7 +46,9 @@
 2. 双击 `launch-widget.vbs`。
 3. 按住悬浮窗空白区域即可拖动。
 
-点击悬浮窗右上角的“日志”按钮，可以查看最近最多 100 次提问的 Token 明细。同一轮提问触发的多次模型调用会合并统计；“占比”是该提问 Token 数占当前日志列表 Token 总数的比例。
+点击悬浮窗右上角的“日志”按钮，可以查看最近最多 100 次提问的 Token 明细。同一轮提问触发的多次模型调用会合并统计；“占比”通过比较提问前后的剩余配额计算，表示该次提问消耗的配额百分点，“剩余”是该轮处理完成后 Codex 主配额周期的剩余百分比。遇到新配额周期时会显示“重置”。
+
+带附件的提问会显示为“实际提问内容（附件：文件名）”，便于区分文件与对应问题；只有附件而没有文字时会显示“仅上传文件”。
 
 `launch-widget.vbs` 会以隐藏窗口方式启动 PowerShell，避免任务栏出现 PowerShell 图标。
 

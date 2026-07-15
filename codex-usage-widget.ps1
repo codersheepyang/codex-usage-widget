@@ -84,7 +84,44 @@ function Get-ResetText($unixSeconds) {
     } catch { return '重置时间未知' }
 }
 
+function Get-QuestionSummary([string]$Message, [int]$MaxLength = 110) {
+    if (-not $Message) { return '（图片或附件提问）' }
+    $question = $Message
+    $attachments = @()
+
+    if ($Message -match '(?s)# Files mentioned by the user:(.*?)(?:## My request for Codex:|$)') {
+        $fileBlock = $matches[1]
+        $attachments = @([regex]::Matches($fileBlock, '(?m)^##\s+([^:\r\n]+):\s+.+$') | ForEach-Object { $_.Groups[1].Value.Trim() })
+        if ($Message -match '(?s)## My request for Codex:\s*(.*)$') { $question = $matches[1] }
+        else { $question = '' }
+    }
+
+    $question = ($question -replace '\s+', ' ').Trim()
+    $attachmentText = ''
+    if ($attachments.Count -gt 0) {
+        $shown = @($attachments | Select-Object -First 2)
+        $attachmentText = '附件：' + ($shown -join '、')
+        if ($attachments.Count -gt 2) { $attachmentText += ' 等' + $attachments.Count + '个文件' }
+    }
+    if (-not $question) { $question = '仅上传文件' }
+    if ($attachmentText) { $question += '（' + $attachmentText + '）' }
+    if ($question.Length -gt $MaxLength) { $question = $question.Substring(0, $MaxLength) + '…' }
+    $question
+}
+
 function Get-UsageLogs([int]$MaxItems = 100) {
+    $titleMap = @{}
+    $sessionIndex = Join-Path $script:CodexHome 'session_index.jsonl'
+    if (Test-Path -LiteralPath $sessionIndex) {
+        foreach ($indexLine in [IO.File]::ReadAllLines($sessionIndex, [Text.Encoding]::UTF8)) {
+            try {
+                $indexRecord = $indexLine | ConvertFrom-Json -ErrorAction Stop
+                if ($indexRecord.id -and $indexRecord.thread_name) {
+                    $titleMap[[string]$indexRecord.id] = ([string]$indexRecord.thread_name -replace '\s+', ' ').Trim()
+                }
+            } catch { }
+        }
+    }
     $roots = @((Join-Path $script:CodexHome 'sessions'), (Join-Path $script:CodexHome 'archived_sessions')) |
         Where-Object { Test-Path -LiteralPath $_ }
     $files = Get-ChildItem -LiteralPath $roots -Filter '*.jsonl' -File -Recurse -ErrorAction SilentlyContinue |
@@ -93,6 +130,8 @@ function Get-UsageLogs([int]$MaxItems = 100) {
 
     foreach ($file in $files) {
         $current = $null
+        $sessionId = if ($file.BaseName -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$') { $matches[1] } else { $file.BaseName }
+        $sessionTitle = if ($titleMap.ContainsKey($sessionId)) { $titleMap[$sessionId] } else { $null }
         foreach ($line in Get-FastTailLines $file.FullName 8388608) {
             if ($line -notmatch '"user_message"|"token_count"') { continue }
             try { $record = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
@@ -100,32 +139,50 @@ function Get-UsageLogs([int]$MaxItems = 100) {
 
             if ($record.payload.type -eq 'user_message') {
                 if ($current -and $current.Tokens -gt 0) { $items.Add([pscustomobject]$current) }
-                $message = [string]$record.payload.message
-                $message = ($message -replace '\s+', ' ').Trim()
-                if ($message.Length -gt 80) { $message = $message.Substring(0, 80) + '…' }
+                $message = Get-QuestionSummary ([string]$record.payload.message)
                 $current = [ordered]@{
+                    SessionKey = $sessionId
+                    SessionTitle = $sessionTitle
                     Start = ([datetime]$record.timestamp).ToLocalTime()
                     End = ([datetime]$record.timestamp).ToLocalTime()
-                    Question = $(if ($message) { $message } else { '（图片或附件提问）' })
+                    Question = $message
                     Tokens = [long]0
                     InputTokens = [long]0
                     OutputTokens = [long]0
+                    RemainingPercent = $null
                 }
             } elseif ($record.payload.type -eq 'token_count' -and $current -and $record.payload.info.last_token_usage) {
                 $usage = $record.payload.info.last_token_usage
                 $current.Tokens += [long]$usage.total_tokens
                 $current.InputTokens += [long]$usage.input_tokens
                 $current.OutputTokens += [long]$usage.output_tokens
+                if ($record.payload.rate_limits.primary.used_percent -ne $null) {
+                    $current.RemainingPercent = [math]::Max(0, 100 - [double]$record.payload.rate_limits.primary.used_percent)
+                }
                 $current.End = ([datetime]$record.timestamp).ToLocalTime()
             }
         }
         if ($current -and $current.Tokens -gt 0) { $items.Add([pscustomobject]$current) }
     }
 
-    $selected = @($items | Sort-Object Start -Descending | Select-Object -First $MaxItems)
-    $total = [double](($selected | Measure-Object Tokens -Sum).Sum)
+    $ordered = @($items | Sort-Object Start)
+    $previousRemaining = $null
+    foreach ($item in $ordered) {
+        $quotaShare = '—'
+        if ($item.RemainingPercent -ne $null -and $previousRemaining -ne $null) {
+            if ($item.RemainingPercent -gt $previousRemaining) { $quotaShare = '重置' }
+            else { $quotaShare = '{0:N0}%' -f ($previousRemaining - $item.RemainingPercent) }
+        }
+        $item | Add-Member -NotePropertyName QuotaShare -NotePropertyValue $quotaShare -Force
+        if ($item.RemainingPercent -ne $null) { $previousRemaining = $item.RemainingPercent }
+    }
+    $selected = @($ordered | Sort-Object Start -Descending | Select-Object -First $MaxItems)
     foreach ($item in $selected) {
         [pscustomobject]@{
+            SessionKey = $item.SessionKey
+            SessionTitle = $item.SessionTitle
+            Date = $item.Start.ToString('yyyy-MM-dd')
+            StartIso = $item.Start.ToString('o')
             TimeRange = if ($item.Start.Date -eq $item.End.Date) {
                 '{0:MM-dd HH:mm:ss}–{1:HH:mm:ss}' -f $item.Start, $item.End
             } else { '{0:MM-dd HH:mm}–{1:MM-dd HH:mm}' -f $item.Start, $item.End }
@@ -133,7 +190,8 @@ function Get-UsageLogs([int]$MaxItems = 100) {
             Tokens = $item.Tokens
             Input = $item.InputTokens
             Output = $item.OutputTokens
-            Share = if ($total -gt 0) { '{0:N2}%' -f ($item.Tokens / $total * 100) } else { '0.00%' }
+            Share = $item.QuotaShare
+            Remaining = if ($item.RemainingPercent -ne $null) { '{0:N0}%' -f $item.RemainingPercent } else { '—' }
         }
     }
 }
@@ -154,11 +212,11 @@ function Show-UsageLogWindow {
  WindowStartupLocation="CenterScreen" Background="#FFF9F7F3" ShowInTaskbar="False"
  FontFamily="Segoe UI Variable Text, Segoe UI">
  <Grid Margin="16">
-  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
   <Grid Grid.Row="0" Margin="0,0,0,12">
    <StackPanel>
     <TextBlock Text="Token 使用日志" FontSize="18" FontWeight="SemiBold" Foreground="#FF252525"/>
-    <TextBlock Text="同一提问触发的多次模型调用已合并；占比基于下方日志的 Token 总量。" FontSize="11" Foreground="#FF747474" Margin="0,4,0,0"/>
+    <TextBlock Text="同一提问触发的多次模型调用已合并；占比表示该次提问消耗的配额百分点。" FontSize="11" Foreground="#FF747474" Margin="0,4,0,0"/>
    </StackPanel>
    <Button Name="ReloadLogButton" Content="刷新" HorizontalAlignment="Right" Width="64" Height="28" Background="#FFFFFFFF" BorderBrush="#FFD8D4CE"/>
   </Grid>
@@ -172,21 +230,27 @@ function Show-UsageLogWindow {
     <DataGridTextColumn Header="输入" Binding="{Binding Input, StringFormat=N0}" Width="85"/>
     <DataGridTextColumn Header="输出" Binding="{Binding Output, StringFormat=N0}" Width="85"/>
     <DataGridTextColumn Header="占比" Binding="{Binding Share}" Width="75"/>
+    <DataGridTextColumn Header="剩余" Binding="{Binding Remaining}" Width="75"/>
    </DataGrid.Columns>
   </DataGrid>
-  <TextBlock Name="LogSummary" Grid.Row="2" Margin="0,10,0,0" Foreground="#FF747474" FontSize="11"/>
+  <Border Grid.Row="2" Margin="0,10,0,0" Padding="10,8" CornerRadius="7" Background="#FFF1EEE8" BorderBrush="#FFE2DED7" BorderThickness="1">
+   <TextBlock Name="TaskSummary" TextWrapping="Wrap" Foreground="#FF444444" FontSize="11" LineHeight="19"/>
+  </Border>
+  <TextBlock Name="LogSummary" Grid.Row="3" Margin="0,8,0,0" Foreground="#FF747474" FontSize="11"/>
  </Grid>
 </Window>
 '@
     $script:LogWindow = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $logXaml))
     $script:LogGrid = $script:LogWindow.FindName('LogGrid')
     $script:LogSummary = $script:LogWindow.FindName('LogSummary')
+    $script:TaskSummary = $script:LogWindow.FindName('TaskSummary')
     $script:LogWindow.Show()
 
     $reload = {
         if ($script:LogLoadProcess -and -not $script:LogLoadProcess.HasExited) { return }
         $script:LogGrid.ItemsSource = $null
         $script:LogSummary.Text = '正在后台读取日志…'
+        $script:TaskSummary.Text = '今日总结正在生成…'
         $script:LogTempFile = Join-Path $env:TEMP ('codex-usage-' + [guid]::NewGuid().ToString('N') + '.json')
         $script:LogErrorFile = $script:LogTempFile + '.err'
         $environmentBackup = $env:CODEX_USAGE_WIDGET_LOG_EXPORT
@@ -220,8 +284,33 @@ function Show-UsageLogWindow {
                 $script:LogGrid.ItemsSource = $data
                 $sum = ($data | Measure-Object Tokens -Sum).Sum
                 $script:LogSummary.Text = '共 {0} 次提问 · 合计 {1:N0} Token · 最多显示最近 100 条' -f $data.Count, $sum
+                $today = (Get-Date).ToString('yyyy-MM-dd')
+                $todayRows = @($data | Where-Object Date -eq $today)
+                $taskGroups = @($todayRows | Group-Object SessionKey)
+                $taskNames = @($taskGroups | ForEach-Object {
+                    $officialTitle = @($_.Group | Where-Object SessionTitle | Select-Object -First 1).SessionTitle
+                    if ($officialTitle) { [string]$officialTitle }
+                    else {
+                        $fallback = [string](($_.Group | Sort-Object StartIso | Select-Object -First 1).Question)
+                        ($fallback -replace '（附件：.*?）', '').Trim()
+                    }
+                })
+                if ($taskNames.Count -eq 0) {
+                    $script:TaskSummary.Text = '今日总结：暂未读取到今天的 Codex 任务。'
+                } else {
+                    $shownTasks = @($taskNames | Select-Object -First 6)
+                    $parts = for ($i = 0; $i -lt $shownTasks.Count; $i++) {
+                        $name = [string]$shownTasks[$i]
+                        if ($name.Length -gt 45) { $name = $name.Substring(0, 45) + '…' }
+                        '{0}. {1}' -f ($i + 1), $name
+                    }
+                    $lines = @('今日总结：大约做了 {0} 件事' -f $taskNames.Count) + $parts
+                    if ($taskNames.Count -gt 6) { $lines += '另有 {0} 件未展开' -f ($taskNames.Count - 6) }
+                    $script:TaskSummary.Text = $lines -join [Environment]::NewLine
+                }
             } catch {
                 $script:LogSummary.Text = '日志读取失败，请点击刷新重试。'
+                $script:TaskSummary.Text = '今日总结生成失败。'
             } finally {
                 Remove-Item -LiteralPath $script:LogTempFile, $script:LogErrorFile -Force -ErrorAction SilentlyContinue
                 $script:LogLoadProcess = $null
@@ -234,6 +323,7 @@ function Show-UsageLogWindow {
         if ($script:LogPollTimer) { $script:LogPollTimer.Stop() }
         $script:LogGrid = $null
         $script:LogSummary = $null
+        $script:TaskSummary = $null
         $script:LogWindow = $null
     })
     & $reload
